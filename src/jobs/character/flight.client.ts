@@ -12,29 +12,29 @@ const moveDirection = {
 	down: new Vector3(),
 };
 
-// Whether the player is currently flying, the speed in studs per second, and
-// the movement direction.
 let enabled = false;
 let speed = 16;
 
-// The root part and current CFrame. Undefined when there is no character.
 let humanoidRoot: BasePart | undefined;
 let coordinate: CFrame | undefined;
 let coordinateSpring = new GroupMotor([0, 0, 0], false);
 
-// ADDITION: momentum state and flight pose state.
+// Momentum + pose state.
 let velocity = new Vector3();
 let humanoid: Humanoid | undefined;
 let originalHipHeight: number | undefined;
+let flyAnimationTrack: AnimationTrack | undefined;
+let originalAnimateDisabled: boolean | undefined;
+
 const ACCELERATION = 3.5;
 const DECELERATION = 4.5;
+const FLY_ANIMATION_ID = "rbxassetid://3547741619";
 
 async function main() {
 	trackCleanup(() => {
 		enabled = false;
 		humanoidRoot = undefined;
 		coordinate = undefined;
-		// ADDITION: reset our extra state on cleanup.
 		humanoid = undefined;
 		velocity = new Vector3();
 		resetDirection();
@@ -45,14 +45,11 @@ async function main() {
 		enabled = job.active;
 		speed = job.value;
 		if (enabled) {
-			// ADDITION: cache character refs so pose can be applied.
 			cacheCharacterRefs();
 			resetCoordinate();
 			resetSpring();
-			// ADDITION: apply the flying pose while the job is active.
 			applyPose();
 		} else {
-			// ADDITION: restore the normal pose when the job is inactive.
 			restorePose();
 		}
 	});
@@ -75,7 +72,6 @@ async function main() {
 	trackConnection(
 		RunService.Heartbeat.Connect((deltaTime) => {
 			if (enabled && humanoidRoot && coordinate) {
-				// ADDITION: momentum step before advancing the coordinate.
 				stepVelocity(deltaTime);
 				updateCoordinate(deltaTime);
 				coordinateSpring.setGoal([
@@ -86,21 +82,31 @@ async function main() {
 				coordinateSpring.step(deltaTime);
 
 				const [x, y, z] = coordinateSpring.getValue();
+
+				// Zero physics so only we move the body.
 				humanoidRoot.AssemblyLinearVelocity = new Vector3();
-				// ADDITION: zero angular velocity too, so physics doesn't fight us.
 				humanoidRoot.AssemblyAngularVelocity = new Vector3();
-				humanoidRoot.CFrame = Workspace.CurrentCamera!.CFrame.Rotation.add(new Vector3(x, y, z));
+
+				// Position is spring-smoothed; rotation comes from the camera
+				// so the body faces where you look. Orientation is handled
+				// separately below so it doesn't fight position.
+				const camera = Workspace.CurrentCamera!;
+				humanoidRoot.CFrame = new CFrame(new Vector3(x, y, z)).mul(camera.CFrame.Rotation);
 			}
 		}),
 	);
 
-	// Update root part CFrame with the Camera's current direction. May be removed
-	// in the future.
+	// Smooth body orientation toward the camera. Runs on RenderStepped so it
+	// stays responsive to mouse movement, but only touches rotation, never
+	// position, so it can't fight the Heartbeat position write.
 	trackConnection(
 		RunService.RenderStepped.Connect(() => {
-			if (enabled && humanoidRoot && coordinate) {
-				humanoidRoot.CFrame = Workspace.CurrentCamera!.CFrame.Rotation.add(humanoidRoot.CFrame.Position);
+			if (!enabled || !humanoidRoot) {
+				return;
 			}
+			const camera = Workspace.CurrentCamera!;
+			const desired = new CFrame(humanoidRoot.Position).mul(camera.CFrame.Rotation);
+			humanoidRoot.CFrame = humanoidRoot.CFrame.Lerp(desired, 0.35);
 		}),
 	);
 
@@ -110,7 +116,6 @@ async function main() {
 			if (newHumanoidRoot && newHumanoidRoot.IsA("BasePart")) {
 				humanoidRoot = newHumanoidRoot;
 			}
-			// ADDITION: refresh cached humanoid and re-apply pose if still flying.
 			cacheCharacterRefs();
 			resetCoordinate();
 			resetSpring();
@@ -127,7 +132,6 @@ async function main() {
 	}
 }
 
-// ADDITION: cache the humanoid reference and remember its original HipHeight.
 function cacheCharacterRefs() {
 	const character = player.Character;
 	if (!character) {
@@ -156,7 +160,6 @@ function resetCoordinate() {
 	}
 	const { XVector, YVector, ZVector } = Workspace.CurrentCamera!.CFrame;
 	coordinate = CFrame.fromMatrix(humanoidRoot.Position, XVector, YVector, ZVector);
-	// ADDITION: also clear momentum on reset.
 	velocity = new Vector3();
 }
 
@@ -171,7 +174,6 @@ function updateCoordinate(deltaTime: number) {
 	if (!coordinate) {
 		return;
 	}
-
 	const { XVector, YVector, ZVector } = Workspace.CurrentCamera!.CFrame;
 	const direction = getUnitDirection();
 
@@ -183,7 +185,6 @@ function updateCoordinate(deltaTime: number) {
 	}
 }
 
-// ADDITION: smooth acceleration/deceleration so movement feels telekinetic.
 function stepVelocity(deltaTime: number) {
 	const camera = Workspace.CurrentCamera!;
 	const input = getUnitDirection();
@@ -195,6 +196,9 @@ function stepVelocity(deltaTime: number) {
 		const forward = new Vector3(look.X, 0, look.Z).Unit;
 		const rightFlat = new Vector3(right.X, 0, right.Z).Unit;
 
+		// W/S is forward/back along the camera's flat forward.
+		// A/D is strafe along the camera's flat right.
+		// Q/E is world up/down.
 		targetVelocity = forward.mul(input.Z * -1)
 			.add(rightFlat.mul(input.X))
 			.add(new Vector3(0, -input.Y, 0));
@@ -205,7 +209,10 @@ function stepVelocity(deltaTime: number) {
 	velocity = velocity.Lerp(targetVelocity.mul(speed), alpha);
 }
 
-// ADDITION: apply the crouch-like flying posture.
+// ---------------------------------------------------------------------------
+// Pose: crouch-like flying posture + fly animation.
+// This NEVER touches CanCollide — that's noclip-worker's job.
+// ---------------------------------------------------------------------------
 function applyPose() {
 	if (!humanoid) {
 		return;
@@ -218,9 +225,24 @@ function applyPose() {
 	humanoid.JumpPower = 0;
 	humanoid.JumpHeight = 0;
 	humanoid.UseJumpPower = true;
+
+	const animate = humanoid.Parent?.FindFirstChild("Animate");
+	if (animate && animate.IsA("BaseScript")) {
+		originalAnimateDisabled = animate.Disabled;
+		animate.Disabled = true;
+	}
+
+	const animator = humanoid.FindFirstChildOfClass("Animator");
+	if (animator && !flyAnimationTrack) {
+		const anim = new Instance("Animation");
+		anim.AnimationId = FLY_ANIMATION_ID;
+		flyAnimationTrack = animator.LoadAnimation(anim);
+		flyAnimationTrack.Looped = true;
+		flyAnimationTrack.Priority = Enum.AnimationPriority.Action;
+		flyAnimationTrack.Play(0.2);
+	}
 }
 
-// ADDITION: restore the humanoid's normal posture.
 function restorePose() {
 	if (humanoid && originalHipHeight !== undefined) {
 		humanoid.HipHeight = originalHipHeight;
@@ -228,6 +250,14 @@ function restorePose() {
 		humanoid.JumpPower = 50;
 		humanoid.JumpHeight = 7.2;
 		humanoid.UseJumpPower = false;
+	}
+	if (flyAnimationTrack) {
+		flyAnimationTrack.Stop(0.2);
+		flyAnimationTrack = undefined;
+	}
+	const animate = humanoid?.Parent?.FindFirstChild("Animate");
+	if (animate && animate.IsA("BaseScript")) {
+		animate.Disabled = originalAnimateDisabled ?? false;
 	}
 }
 
